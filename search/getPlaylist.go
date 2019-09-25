@@ -2,6 +2,7 @@ package search
 
 import (
   "fmt"
+  "sync"
 
   "google.golang.org/api/youtube/v3"
 
@@ -9,8 +10,8 @@ import (
 )
 
 // Retrieve playlistItems in the specified playlist
-func playlistItemsList(service *youtube.Service, part string, playlistId string, pageToken string) (*youtube.PlaylistItemListResponse, error) {
-  call := service.PlaylistItems.List(part)
+func playlistItemsList(service *youtube.Service, playlistId string, pageToken string) (*youtube.PlaylistItemListResponse, error) {
+  call := service.PlaylistItems.List("snippet")
   call = call.PlaylistId(playlistId)
   call = call.MaxResults(50)
   if pageToken != "" {
@@ -20,10 +21,62 @@ func playlistItemsList(service *youtube.Service, part string, playlistId string,
   if err != nil {
     return nil, err
   }
+
   return response, nil
 }
 
+func loadVidInfo(waitgroup *sync.WaitGroup, vidID string, vidIndex int, vids []SearchVideo) {
+  defer waitgroup.Done()
+  defer func () {
+    if (recover() != nil) {
+      fmt.Println("Routine Paniced")
+    }
+  }()
+
+  tmpInfo, err := info.GetVideoInfo(vidID)
+  if err != nil {
+    return
+  }
+
+  tmpResult := SearchVideo{
+    ID: tmpInfo.ID,
+    Title: tmpInfo.Title,
+    Channel: tmpInfo.Channel,
+  }
+
+  vids[vidIndex] = tmpResult
+
+}
+
+func loadPage(pageToken string, plID string, service *youtube.Service) (string, []SearchVideo) {
+  // Retrieve next set of items in the playlist.
+  playlistResponse, err := playlistItemsList(service, plID, pageToken)
+  if err != nil {
+    fmt.Printf("Error: %v \n", err)
+
+    return "", nil
+  }
+
+  vids := make([]SearchVideo, len(playlistResponse.Items))
+  var waitgroup sync.WaitGroup
+
+  for index, playlistItem := range playlistResponse.Items {
+    waitgroup.Add(1)
+    vidID := playlistItem.Snippet.ResourceId.VideoId
+
+    go loadVidInfo(&waitgroup, vidID, index, vids)
+  }
+
+  waitgroup.Wait()
+
+  // Set the token to retrieve the next page of results
+  // or exit the loop if all results have been retrieved.
+  return playlistResponse.NextPageToken, vids
+}
+
 func GetPlaylist(playlistId string) (SearchResult, error) {
+  fmt.Println("Loading Playlist")
+
   service, err := getYTService()
   if err != nil {
     return SearchResult{}, err
@@ -35,38 +88,20 @@ func GetPlaylist(playlistId string) (SearchResult, error) {
 
   nextPageToken := ""
   for {
-    // Retrieve next set of items in the playlist.
-    playlistResponse, err := playlistItemsList(service, "snippet", playlistId, nextPageToken)
-    if err != nil {
-      fmt.Printf("Error: %v \n", err)
+    fmt.Println("Loading Page")
+    nPageToken, vids := loadPage(nextPageToken, playlistId, service)
 
-      return SearchResult{}, err
-    }
-
-    for _, playlistItem := range playlistResponse.Items {
-      vidID := playlistItem.Snippet.ResourceId.VideoId
-
-      tmpInfo, err := info.GetVideoInfo(vidID)
-      if err != nil {
-        continue
-      }
-
-      tmpResult := SearchVideo{
-        ID: tmpInfo.ID,
-        Title: tmpInfo.Title,
-        Channel: tmpInfo.Channel,
-      }
-
-      result.Videos = append(result.Videos, tmpResult)
-    }
+    result.Videos = append(result.Videos, vids...)
 
     // Set the token to retrieve the next page of results
     // or exit the loop if all results have been retrieved.
-    nextPageToken = playlistResponse.NextPageToken
+    nextPageToken = nPageToken
     if nextPageToken == "" {
       break
     }
   }
+
+  fmt.Println("Loaded Playlist")
 
   return result, nil
 }
